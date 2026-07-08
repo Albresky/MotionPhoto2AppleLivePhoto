@@ -1,0 +1,6 @@
+/target
+testdata
+testoutput
+deps
+pkg-config
+/data

@@ -1,0 +1,831 @@
+#!/usr/bin/env python3
+"""
+GUI batch utility for inspecting Live Photo / Motion Photo media trees.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import queue
+import shutil
+import subprocess
+import threading
+import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Dict, List, Tuple
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+# 假设 pyheic_struct 在你的 Python 路径中
+try:
+    from pyheic_struct import AppleTargetAdapter, HEICFile, convert_motion_photo
+except ImportError:
+    print("Warning: pyheic_struct not found. Using mock objects.")
+    
+    class MockHEICFile:
+        def __init__(self, path: str):
+            self._path = Path(path)
+        def find_box(self, box_type: str) -> bool:
+            # 模拟三星 motion photo
+            return "samsung" in self._path.name.lower()
+    
+    class MockAppleTargetAdapter:
+        pass
+    
+    def mock_convert_motion_photo(heic_path, vendor_hint, target_adapter, output_still, output_video, inject_content_id_into_mov):
+        output_still.touch()
+        output_video.touch()
+        return output_still, output_video
+    
+    HEICFile = MockHEICFile
+    AppleTargetAdapter = MockAppleTargetAdapter
+    convert_motion_photo = mock_convert_motion_photo
+# --- End of Mocking ---
+
+STILL_SUFFIXES = {".heic", ".heif"}
+VIDEO_SUFFIXES = {".mov", ".mp4", ".m4v", ".qt", ".3gp"}
+
+TRANSLATIONS: Dict[str, Dict[str, str]] = {
+    "zh": {
+        "app_title": "Live Photo / Motion Photo 批处理工具",
+        "menu_language": "Language",
+        "menu_language_zh": "中文",
+        "menu_language_en": "English",
+        "label_directory": "处理目录:",
+        "button_browse": "选择…",
+        "group_options": "可选功能",
+        "option_live_pair": "检测 Live Photo 配对并移动缺失伴侣的视频",
+        "option_convert_motion": "将三星 Motion Photo 转换为 Live Photo",
+        "option_cleanup_mp4": "清除带有 MotionPhoto_Data 标记的多余 MP4",
+        "option_archive_originals": "归档原始三星照片 (转换为zip)",
+        "label_workers": "并发线程数:",
+        "button_start": "开始处理",
+        "progress_status": "进度: {done} / {total}",
+        "log_group": "日志",
+        "warn_processing_title": "正在处理",
+        "warn_processing_body": "任务仍在运行，请稍候。",
+        "error_invalid_dir_title": "无效路径",
+        "error_invalid_dir_body": "请选择一个有效的目录。",
+        "general_yes": "是",
+        "general_no": "否",
+        "log_root_dir": "处理目录: {path}",
+        "log_exiftool": "exiftool 可用: {status}",
+        "log_scanning": "正在扫描媒体文件……",
+        "log_no_tasks": "未找到任何任务，无需处理。",
+        "log_executing": "共有 {total} 个任务，使用 {workers} 个线程执行……",
+        "log_task_entry": "[{task}] {result}",
+        "log_finished": "全部任务已完成。",
+        "log_processing_done": "处理完毕。",
+        "log_archiving": "正在归档原始照片...",
+        "log_archive_complete": "归档完成: {zip_path}",
+        "log_archive_failed": "归档失败: {error}",
+        "log_archived_path": "已归档: {src} -> {dest}",
+        "log_cancel_requested": "已请求中止，正在等待正在运行的任务完成…",
+        "log_cancelled": "处理已中止。",
+        "archive_dir_name": "归档",
+        "task_orphan_video": "孤立视频: {path}", # (此翻译保留，但逻辑已更改)
+        "task_motion_convert": "Motion Photo 转 Live Photo: {path}",
+        "task_cleanup_mp4": "清理 MP4: {path}", # (此翻译保留，但逻辑已更改)
+        "task_process_video": "处理视频: {path}", # 新增
+        "result_moved": "已移动到 {dest} (孤立LivePhoto)", # 修改
+        "result_skipped_exists": "已存在转换结果，跳过",
+        "result_converted": "已转换为 {heic} / {mov}",
+        "result_cleanup_removed": "已删除 (MotionPhoto_Data)",
+        "result_cleanup_kept": "保留 (非目标视频)", # 修改
+        "result_cleanup_skipped": "跳过 (缺少 exiftool)",
+        "result_failed": "失败: {error}",
+        "result_cancelled": "已取消",
+        "result_archived": "已归档原始文件",
+        "button_stop": "停止",
+    },
+    "en": {
+        "app_title": "Live / Motion Photo Batch Manager",
+        "menu_language": "语言/Language",
+        "menu_language_zh": "Chinese",
+        "menu_language_en": "English",
+        "label_directory": "Folder:",
+        "button_browse": "Browse…",
+        "group_options": "Optional Tasks",
+        "option_live_pair": "Check Live Photo pairs and move orphaned videos",
+        "option_convert_motion": "Convert Samsung Motion Photos to Live Photo",
+        "option_cleanup_mp4": "Remove redundant MP4 files tagged MotionPhoto_Data",
+        "option_archive_originals": "Archive original Samsung photos (as zip)",
+        "label_workers": "Worker threads:",
+        "button_start": "Start",
+        "progress_status": "Progress: {done} / {total}",
+        "log_group": "Log",
+        "warn_processing_title": "Processing",
+        "warn_processing_body": "Tasks are still running. Please wait.",
+        "error_invalid_dir_title": "Invalid Path",
+        "error_invalid_dir_body": "Please choose a valid directory.",
+        "general_yes": "yes",
+        "general_no": "no",
+        "log_root_dir": "Root directory: {path}",
+        "log_exiftool": "exiftool available: {status}",
+        "log_scanning": "Scanning media files...",
+        "log_no_tasks": "No tasks found. Nothing to do.",
+        "log_executing": "Executing {total} task(s) with {workers} worker(s)...",
+        "log_task_entry": "[{task}] {result}",
+        "log_finished": "All tasks completed.",
+        "log_processing_done": "Processing finished.",
+        "log_archiving": "Archiving original photos...",
+        "log_archive_complete": "Archive complete: {zip_path}",
+        "log_archive_failed": "Archive failed: {error}",
+        "log_archived_path": "Archived: {src} -> {dest}",
+        "log_cancel_requested": "Cancellation requested. Waiting for running tasks…",
+        "log_cancelled": "Processing cancelled.",
+        "archive_dir_name": "Archive",
+        "task_orphan_video": "Orphan video: {path}", # (Retained, logic changed)
+        "task_motion_convert": "Motion Photo → Live Photo: {path}",
+        "task_cleanup_mp4": "Cleanup MP4: {path}", # (Retained, logic changed)
+        "task_process_video": "Processing video: {path}", # New
+        "result_moved": "Moved to {dest} (Orphaned LivePhoto)", # Modified
+        "result_skipped_exists": "Skipped (outputs already exist)",
+        "result_converted": "Converted to {heic} / {mov}",
+        "result_cleanup_removed": "Removed (MotionPhoto_Data)",
+        "result_cleanup_kept": "Kept (Not a target video)", # Modified
+        "result_cleanup_skipped": "Skipped (exiftool unavailable)",
+        "result_failed": "Failed: {error}",
+        "result_cancelled": "Cancelled",
+        "result_archived": "Archived original file",
+        "button_stop": "Stop",
+    },
+}
+
+
+@dataclass
+class ProcessingOptions:
+    root_dir: Path
+    handle_live_pairs: bool
+    convert_motion: bool
+    remove_motion_mp4: bool
+    archive_originals: bool
+    max_workers: int
+    stop_event: threading.Event
+
+
+@dataclass
+class Task:
+    func: Callable[[], dict]
+    description: str
+
+
+def _is_motion_photo(heic_path: Path) -> bool:
+    try:
+        heic = HEICFile(str(heic_path))
+        return heic.find_box("mpvd") is not None
+    except Exception:
+        return False
+
+
+def _move_orphan_video(mov_path: Path, root_dir: Path, tr: Callable[[str], str]) -> dict:
+    """辅助函数：移动孤立视频并返回结果字典"""
+    error_dir = root_dir / "错误的LivePhoto视频"
+    error_dir.mkdir(parents=True, exist_ok=True)
+
+    destination = error_dir / mov_path.name
+    counter = 1
+    while destination.exists():
+        destination = error_dir / f"{mov_path.stem}_{counter}{mov_path.suffix}"
+        counter += 1
+
+    shutil.move(str(mov_path), str(destination))
+    return {"status": "MOVED", "message": tr("result_moved", dest=str(destination))}
+
+
+def _convert_motion_photo(
+    heic_path: Path,
+    inject_mov_tag: bool,
+    options: ProcessingOptions,
+    tr: Callable[[str], str],
+) -> dict:
+    if options.stop_event.is_set():
+        return {"status": "CANCELLED", "message": tr("result_cancelled")}
+
+    output_still = heic_path.with_name(f"{heic_path.stem}_apple_compatible.HEIC")
+    output_video = heic_path.with_name(f"{heic_path.stem}_apple_compatible.MOV")
+
+    if output_still.exists() or output_video.exists():
+        return {"status": "SKIPPED", "message": tr("result_skipped_exists")}
+
+    heic_out, mov_out = convert_motion_photo(
+        heic_path,
+        vendor_hint="samsung",
+        target_adapter=AppleTargetAdapter(),
+        output_still=output_still,
+        output_video=output_video,
+        inject_content_id_into_mov=inject_mov_tag,
+    )
+    return {
+        "status": "CONVERTED",
+        "message": tr("result_converted", heic=heic_out.name, mov=mov_out.name),
+        "original_path": heic_path,
+    }
+
+# --- 新增：统一的视频处理任务 ---
+def _process_video(
+    video_path: Path,
+    has_still_pair: bool,
+    options: ProcessingOptions,
+    has_exiftool: bool,
+    tr: Callable[[str], str],
+) -> dict:
+    """
+    根据元数据和用户选项处理单个视频文件（MP4, MOV 等）。
+    实现新的优先级逻辑。
+    """
+
+    if options.stop_event.is_set():
+        return {"status": "CANCELLED", "message": tr("result_cancelled")}
+
+    # 如果两个选项都没选，或者没有 exiftool，我们只能执行旧的“孤立”逻辑
+    if not has_exiftool:
+        if options.handle_live_pairs and not has_still_pair:
+            # 这是没有 exiftool 时能做的唯一判断
+            return _move_orphan_video(video_path, options.root_dir, tr)
+        elif options.remove_motion_mp4:
+            return {"status": "SKIPPED_EXIF", "message": tr("result_cleanup_skipped")}
+        else:
+            return {"status": "SKIPPED", "message": tr("result_cleanup_kept")}
+
+    # --- 有 Exiftool，执行新逻辑 ---
+    try:
+        cmd = [
+            "exiftool",
+            "-j",
+            "-EmbeddedVideoType",
+            "-ContentIdentifier",
+            str(video_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        output = result.stdout.strip()
+        if result.returncode != 0 and not output:
+            raise RuntimeError(result.stderr.strip() or "exiftool invocation failed")
+
+        metadata: Dict[str, str] = {}
+        if output:
+            try:
+                data = json.loads(output)
+                if isinstance(data, list) and data:
+                    first_record = data[0]
+                    if isinstance(first_record, dict):
+                        metadata = {
+                            str(k): str(v).strip() if isinstance(v, str) else str(v)
+                            for k, v in first_record.items()
+                        }
+            except json.JSONDecodeError:
+                for line in output.splitlines():
+                    if ":" not in line:
+                        continue
+                    key, value = line.split(":", 1)
+                    metadata[key.strip()] = value.strip()
+        if not metadata:
+            metadata = {}
+        
+        embedded_type = str(metadata.get("EmbeddedVideoType", ""))
+        content_identifier = str(metadata.get("ContentIdentifier", "")).strip()
+
+        has_motion_data = "MotionPhoto_Data" in embedded_type
+        has_content_id = bool(content_identifier)
+
+        # 优先级 1：检查是否为多余的 MotionPhoto_Data (如果选项开启)
+        if options.remove_motion_mp4 and has_motion_data:
+            video_path.unlink(missing_ok=True)
+            return {"status": "REMOVED", "message": tr("result_cleanup_removed")}
+
+        # 优先级 2：检查是否为孤立的 Live Photo (如果选项开启)
+        if (
+            options.handle_live_pairs and
+            not has_still_pair and
+            has_content_id and
+            not has_motion_data # 关键：确保它不是 MotionPhoto
+        ):
+            return _move_orphan_video(video_path, options.root_dir, tr)
+
+        # 其他所有情况（例如：有配对的视频、无元数据的视频等）
+        return {"status": "KEPT", "message": tr("result_cleanup_kept")}
+
+    except Exception as e:
+        return {"status": "FAILED", "message": tr("result_failed", error=e)}
+
+
+def _gather_tasks(
+    options: ProcessingOptions,
+    has_exiftool: bool,
+    log: Callable[[str], None],
+    tr: Callable[[str], str],
+) -> List[Task]:
+    tasks: List[Task] = []
+    base_map: Dict[Tuple[Path, str], Dict[str, object]] = {}
+    heic_files: List[Path] = []
+    all_video_files: List[Path] = [] # 修改：收集所有视频
+
+    log(tr("log_scanning"))
+    for path in options.root_dir.rglob("*"):
+        if options.stop_event.is_set():
+            break
+        if not path.is_file():
+            continue
+        suffix = path.suffix.lower()
+        key = (path.parent, path.stem.lower())
+        entry = base_map.setdefault(key, {})
+
+        if suffix in STILL_SUFFIXES:
+            heic_files.append(path)
+            entry["still"] = path
+        elif suffix in VIDEO_SUFFIXES:
+            all_video_files.append(path) # 修改
+            entry.setdefault("videos", []).append(path) # type: ignore
+
+    # --- 任务分派逻辑修改 ---
+
+    # 1. (不变) 三星 Motion Photo 转换任务
+    if options.convert_motion:
+        inject_mov_tag = has_exiftool
+        for heic_path in heic_files:
+            if options.stop_event.is_set():
+                break
+            key = (heic_path.parent, heic_path.stem.lower())
+            entry = base_map.get(key, {})
+            videos = entry.get("videos") or []
+            has_mov = any(v.suffix.lower() == ".mov" for v in videos) # type: ignore
+            if has_mov:
+                continue
+            if not _is_motion_photo(heic_path):
+                continue
+            tasks.append(
+                Task(
+                    func=lambda p=heic_path, tr=tr: _convert_motion_photo(
+                        p, inject_mov_tag, options, tr
+                    ),
+                    description=tr("task_motion_convert", path=str(heic_path)),
+                )
+            )
+
+    # 2. (新增) 统一的视频处理任务 (替代旧的 MP4 清理和孤立视频移动)
+    if options.handle_live_pairs or options.remove_motion_mp4:
+        for video_path in all_video_files:
+            if options.stop_event.is_set():
+                break
+            key = (video_path.parent, video_path.stem.lower())
+            has_still = "still" in base_map.get(key, {})
+            
+            tasks.append(
+                Task(
+                    func=lambda p=video_path, hs=has_still: _process_video(
+                        p, hs, options, has_exiftool, tr
+                    ),
+                    description=tr("task_process_video", path=str(video_path)),
+                )
+            )
+
+    return tasks
+
+
+def _worker(options: ProcessingOptions, message_queue: queue.Queue, language: str) -> None:
+    has_exiftool = shutil.which("exiftool") is not None
+
+    lang_map = TRANSLATIONS.get(language, TRANSLATIONS["zh"])
+
+    def tr(key: str, **kwargs) -> str:
+        template = lang_map.get(key, TRANSLATIONS["zh"].get(key, key))
+        return template.format(**kwargs)
+
+    def emit_log(message: str) -> None:
+        message_queue.put(("log", message))
+
+    emit_log(tr("log_root_dir", path=str(options.root_dir)))
+    status_text = tr("general_yes") if has_exiftool else tr("general_no")
+    emit_log(tr("log_exiftool", status=status_text))
+
+    files_to_archive: List[Path] = []
+
+    try:
+        tasks = _gather_tasks(options, has_exiftool, emit_log, tr)
+        total = len(tasks)
+        message_queue.put(("progress_setup", total))
+
+        if total == 0:
+            emit_log(tr("log_no_tasks"))
+            message_queue.put(("finished", None))
+            return
+
+        max_workers = max(1, options.max_workers)
+        emit_log(tr("log_executing", total=total, workers=max_workers))
+
+        completed = 0
+        cancelled = False
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {executor.submit(task.func): task for task in tasks}
+            for future in as_completed(future_map):
+                task = future_map[future]
+                try:
+                    outcome = future.result()
+                    result_text = outcome.get("message", "done")
+
+                    if (
+                        options.archive_originals and
+                        outcome.get("status") == "CONVERTED" and
+                        "original_path" in outcome
+                    ):
+                        files_to_archive.append(outcome["original_path"])
+                        result_text += f" ({tr('result_archived')})"
+
+                except CancelledError:
+                    result_text = tr("result_cancelled")
+                    cancelled = True
+                except Exception as exc:
+                    result_text = tr("result_failed", error=exc)
+                emit_log(tr("log_task_entry", task=task.description, result=result_text))
+                completed += 1
+                message_queue.put(("progress", completed))
+
+                if options.stop_event.is_set():
+                    cancelled = True
+                    for pending_future in future_map:
+                        if not pending_future.done():
+                            pending_future.cancel()
+                    break
+
+        if cancelled or options.stop_event.is_set():
+            emit_log(tr("log_cancelled"))
+        else:
+            if options.archive_originals and files_to_archive:
+                emit_log(tr("log_archiving"))
+                archive_dir_name = tr("archive_dir_name")
+                archive_base_dir = options.root_dir / archive_dir_name
+                
+                try:
+                    for original_path in files_to_archive:
+                        relative_path = original_path.relative_to(options.root_dir)
+                        archive_dest = archive_base_dir / relative_path
+                        archive_dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(original_path), str(archive_dest))
+                        emit_log(
+                            tr(
+                                "log_archived_path",
+                                src=str(relative_path),
+                                dest=str(archive_dest.relative_to(options.root_dir)),
+                            )
+                        )
+
+                    datestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    zip_name_base = f"{archive_dir_name}_{datestamp}"
+                    
+                    zip_path_str = shutil.make_archive(
+                        base_name=str(options.root_dir / zip_name_base),
+                        format="zip",
+                        root_dir=options.root_dir,
+                        base_dir=archive_dir_name,
+                    )
+                    
+                    # shutil.rmtree(archive_base_dir) # 归档后删除原文件夹
+
+                    emit_log(tr("log_archive_complete", zip_path=Path(zip_path_str).name))
+
+                except Exception as e:
+                    emit_log(tr("log_archive_failed", error=e))
+
+            emit_log(tr("log_finished"))
+    except Exception as e:
+        emit_log(tr("result_failed", error=e))
+    finally:
+        message_queue.put(("finished", None))
+
+
+class BatchManagerGUI:
+    
+    def __init__(self) -> None:
+        self.root = tk.Tk()
+        # 标题与所有文案通过 _update_ui_text 统一设置
+        self.root.geometry("780x520")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.lang = tk.StringVar(value="zh")
+
+        self.queue: queue.Queue = queue.Queue()
+        self.worker_thread: threading.Thread | None = None
+        self.stop_event = threading.Event()
+
+        self.path_var = tk.StringVar()
+        self.handle_live_var = tk.BooleanVar(value=True)
+        self.convert_motion_var = tk.BooleanVar(value=True)
+        self.remove_mp4_var = tk.BooleanVar(value=True)
+        self.archive_originals_var = tk.BooleanVar(value=True)
+        default_workers = max(1, min(4, (os.cpu_count() or 4)))
+        self.worker_count_var = tk.IntVar(value=default_workers)
+
+        self.progress_total = 0
+        self.progress_done = 0
+
+        # 需要在更新语言时动态修改文本的控件引用
+        self.label_directory = None
+        self.browse_button = None
+        self.options_frame = None
+        self.cb_live_pair = None
+        self.cb_convert_motion = None
+        self.cb_cleanup_mp4 = None
+        self.cb_archive_originals = None
+        self.label_workers = None
+        self.worker_spin = None
+        self.start_button = None
+        self.stop_button = None
+        self.progress_bar = None
+        self.progress_label = None
+        self.log_frame = None
+        self.log_text = None
+
+        # 菜单引用
+        self.menubar = None
+
+        self._build_ui()
+        self._build_menubar()
+        self._update_ui_text()
+
+        self.root.after(100, self._poll_queue)
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+    def _t(self, key: str) -> str:
+        lang_map = TRANSLATIONS.get(self.lang.get(), TRANSLATIONS["zh"])
+        return lang_map.get(key, TRANSLATIONS["zh"].get(key, key))
+
+    # ========== 新增：菜单与语言切换 ==========
+    def _set_language(self, lang: str) -> None:
+        """切换语言并刷新所有 UI 文案。"""
+        if lang not in TRANSLATIONS:
+            return
+        self.lang.set(lang)
+        self._build_menubar()      # 先重建菜单（更新顶层文本）
+        self._update_ui_text()     # 再更新其余控件文本
+
+    def _build_menubar(self) -> None:
+        """根据当前语言重建菜单（最简单可靠地更新 cascade 文本）。"""
+        if self.menubar is not None:
+            # 移除旧菜单
+            self.root.config(menu=tk.Menu(self.root))  # 临时空菜单
+        menubar = tk.Menu(self.root)
+
+        # 语言菜单
+        language_menu = tk.Menu(menubar, tearoff=0)
+        language_menu.add_command(
+            label=self._t("menu_language_zh"),
+            command=lambda: self._set_language("zh")
+        )
+        language_menu.add_command(
+            label=self._t("menu_language_en"),
+            command=lambda: self._set_language("en")
+        )
+        menubar.add_cascade(label=self._t("menu_language"), menu=language_menu)
+
+        self.menubar = menubar
+        self.root.config(menu=self.menubar)
+
+    # ========== 原有 UI 构建，加入控件引用 ==========
+    def _build_ui(self) -> None:
+        padding = {"padx": 10, "pady": 6}
+
+        path_frame = ttk.Frame(self.root)
+        path_frame.pack(fill="x", **padding)
+
+        self.label_directory = ttk.Label(path_frame, text=self._t("label_directory"))
+        self.label_directory.pack(side="left")
+        entry = ttk.Entry(path_frame, textvariable=self.path_var)
+        entry.pack(side="left", fill="x", expand=True, padx=(8, 8))
+
+        self.browse_button = ttk.Button(path_frame, text=self._t("button_browse"), command=self._choose_directory)
+        self.browse_button.pack(side="left")
+
+        self.options_frame = ttk.LabelFrame(self.root, text=self._t("group_options"))
+        self.options_frame.pack(fill="x", **padding)
+
+        self.cb_live_pair = ttk.Checkbutton(
+            self.options_frame,
+            text=self._t("option_live_pair"),
+            variable=self.handle_live_var,
+        )
+        self.cb_live_pair.pack(anchor="w", padx=8, pady=2)
+
+        self.cb_convert_motion = ttk.Checkbutton(
+            self.options_frame,
+            text=self._t("option_convert_motion"),
+            variable=self.convert_motion_var,
+        )
+        self.cb_convert_motion.pack(anchor="w", padx=8, pady=2)
+
+        self.cb_cleanup_mp4 = ttk.Checkbutton(
+            self.options_frame,
+            text=self._t("option_cleanup_mp4"),
+            variable=self.remove_mp4_var,
+        )
+        self.cb_cleanup_mp4.pack(anchor="w", padx=8, pady=2)
+
+        self.cb_archive_originals = ttk.Checkbutton(
+            self.options_frame,
+            text=self._t("option_archive_originals"),
+            variable=self.archive_originals_var,
+        )
+        self.cb_archive_originals.pack(anchor="w", padx=8, pady=2)
+
+        worker_frame = ttk.Frame(self.root)
+        worker_frame.pack(fill="x", **padding)
+        self.label_workers = ttk.Label(worker_frame, text=self._t("label_workers"))
+        self.label_workers.pack(side="left")
+        self.worker_spin = ttk.Spinbox(
+            worker_frame,
+            from_=1,
+            to=32,
+            textvariable=self.worker_count_var,
+            width=5,
+        )
+        self.worker_spin.pack(side="left", padx=(8, 0))
+
+        control_frame = ttk.Frame(self.root)
+        control_frame.pack(fill="x", **padding)
+        self.start_button = ttk.Button(control_frame, text=self._t("button_start"), command=self._start_processing)
+        self.start_button.pack(side="left")
+        self.stop_button = ttk.Button(control_frame, text=self._t("button_stop"), command=self._stop_processing)
+        self.stop_button.pack(side="left", padx=(8, 0))
+        self.stop_button.config(state="disabled")
+
+        self.progress_bar = ttk.Progressbar(self.root, mode="determinate")
+        self.progress_bar.pack(fill="x", padx=10, pady=(4, 0))
+
+        self.progress_label = ttk.Label(self.root, text=self._t("progress_status").format(done=0, total=0))
+        self.progress_label.pack(fill="x", padx=10, pady=(2, 6))
+
+        self.log_frame = ttk.LabelFrame(self.root, text=self._t("log_group"))
+        self.log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.log_text = tk.Text(self.log_frame, height=16, wrap="word")
+        self.log_text.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(self.log_frame, command=self.log_text.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.log_text.configure(yscrollcommand=scrollbar.set)
+
+    # ========== 新增：根据当前语言刷新所有控件文本 ==========
+    def _refresh_progress_label(self) -> None:
+        self.progress_label.config(
+            text=self._t("progress_status").format(done=self.progress_done, total=self.progress_total)
+        )
+
+    def _update_ui_text(self) -> None:
+        # 窗口标题
+        self.root.title(self._t("app_title"))
+
+        # 顶部输入区
+        if self.label_directory is not None:
+            self.label_directory.config(text=self._t("label_directory"))
+        if self.browse_button is not None:
+            self.browse_button.config(text=self._t("button_browse"))
+
+        # 选项分组
+        if self.options_frame is not None:
+            self.options_frame.config(text=self._t("group_options"))
+        if self.cb_live_pair is not None:
+            self.cb_live_pair.config(text=self._t("option_live_pair"))
+        if self.cb_convert_motion is not None:
+            self.cb_convert_motion.config(text=self._t("option_convert_motion"))
+        if self.cb_cleanup_mp4 is not None:
+            self.cb_cleanup_mp4.config(text=self._t("option_cleanup_mp4"))
+        if self.cb_archive_originals is not None:
+            self.cb_archive_originals.config(text=self._t("option_archive_originals"))
+
+        # 线程/控制区
+        if self.label_workers is not None:
+            self.label_workers.config(text=self._t("label_workers"))
+        if self.start_button is not None:
+            self.start_button.config(text=self._t("button_start"))
+        if self.stop_button is not None:
+            self.stop_button.config(text=self._t("button_stop"))
+
+        # 进度文本
+        if self.progress_label is not None:
+            self._refresh_progress_label()
+
+        # 日志分组
+        if self.log_frame is not None:
+            self.log_frame.config(text=self._t("log_group"))
+
+        # 菜单（每次切换语言已在 _build_menubar 重建，此处无需再次处理）
+
+    def _choose_directory(self) -> None:
+        selected = filedialog.askdirectory()
+        if selected:
+            self.path_var.set(selected)
+
+    def _start_processing(self) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showwarning(self._t("warn_processing_title"), self._t("warn_processing_body"))
+            return
+
+        directory = Path(self.path_var.get()).expanduser()
+        if not directory.is_dir():
+            messagebox.showerror(self._t("error_invalid_dir_title"), self._t("error_invalid_dir_body"))
+            return
+
+        self.stop_event.clear()
+
+        options = ProcessingOptions(
+            root_dir=directory,
+            handle_live_pairs=self.handle_live_var.get(),
+            convert_motion=self.convert_motion_var.get(),
+            remove_motion_mp4=self.remove_mp4_var.get(),
+            archive_originals=self.archive_originals_var.get(),
+            max_workers=self.worker_count_var.get(),
+            stop_event=self.stop_event,
+        )
+
+        self._reset_progress()
+        self.start_button.config(state="disabled")
+        self.worker_spin.config(state="disabled")
+        if self.stop_button is not None:
+            self.stop_button.config(state="normal")
+
+        self.worker_thread = threading.Thread(
+            target=_worker,
+            args=(options, self.queue, self.lang.get()),
+            daemon=True,
+        )
+        self.worker_thread.start()
+
+    def _stop_processing(self) -> None:
+        if not (self.worker_thread and self.worker_thread.is_alive()):
+            return
+        if not self.stop_event.is_set():
+            self.stop_event.set()
+            self.queue.put(("log", self._t("log_cancel_requested")))
+        if self.stop_button is not None:
+            self.stop_button.config(state="disabled")
+
+    def _reset_progress(self) -> None:
+        self.progress_total = 0
+        self.progress_done = 0
+        self.progress_bar["value"] = 0
+        self.progress_bar["maximum"] = 1
+        self.progress_label.config(text=self._t("progress_status").format(done=0, total=0))
+        self.log_text.delete("1.0", tk.END)
+        if self.stop_button is not None:
+            self.stop_button.config(state="disabled")
+
+    def _poll_queue(self) -> None:
+        try:
+            while True:
+                message = self.queue.get_nowait()
+                self._handle_message(message)
+        except queue.Empty:
+            pass
+        finally:
+            self.root.after(100, self._poll_queue)
+
+    def _handle_message(self, message: Tuple[str, object]) -> None:
+        kind, payload = message
+
+        if kind == "log":
+            text = str(payload)
+            self.log_text.insert(tk.END, text + "\n")
+            self.log_text.see(tk.END)
+        elif kind == "progress_setup":
+            self.progress_total = int(payload) if payload else 0
+            self.progress_done = 0
+            self.progress_bar["maximum"] = max(1, self.progress_total)
+            self.progress_bar["value"] = 0
+            self.progress_label.config(text=self._t("progress_status").format(done=0, total=self.progress_total))
+        elif kind == "progress":
+            self.progress_done = int(payload)
+            self.progress_bar["value"] = self.progress_done
+            self.progress_label.config(text=self._t("progress_status").format(done=self.progress_done, total=self.progress_total))
+        elif kind == "finished":
+            self.start_button.config(state="normal")
+            self.worker_spin.config(state="normal")
+            if self.stop_button is not None:
+                self.stop_button.config(state="disabled")
+            self.stop_event.clear()
+            self.log_text.insert(tk.END, self._t("log_processing_done") + "\n")
+            self.log_text.see(tk.END)
+
+    def _on_close(self) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            self._stop_processing()
+            self.root.after(100, self._wait_for_worker_and_close)
+        else:
+            self.root.destroy()
+
+    def _wait_for_worker_and_close(self) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.root.after(100, self._wait_for_worker_and_close)
+        else:
+            self.root.destroy()
+
+
+def main() -> None:
+    gui = BatchManagerGUI()
+    gui.run()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()

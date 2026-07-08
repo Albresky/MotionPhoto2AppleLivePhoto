@@ -1,0 +1,49 @@
+# 转换产物
+output/
+*.csv
+
+# 数据集与外部数据
+datasets/
+xiaomi
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 测试与缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# Cargo / Rust 构建产物（reference 子项目可能含有）
+target/
+
+# Webapp 前端构建产物与依赖
+webapp/frontend/node_modules/
+webapp/frontend/dist/
+
+# 用户运行时数据
+.mvimg2livephoto/
